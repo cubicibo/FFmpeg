@@ -154,18 +154,19 @@ static av_cold int close_decoder(AVCodecContext *avctx)
  * The subtitle is stored as a Run Length Encoded image.
  *
  * @param avctx contains the current codec context
- * @param sub pointer to the processed subtitle data
- * @param buf pointer to the RLE data to process
- * @param buf_size size of the RLE data to process
+ * @param rect pointer to the processed subtitle data
+ * @param object pointer to the presentation graphic to process
+ * @param cobj pointer to the composition object infos
  */
 static int decode_rle(AVCodecContext *avctx, AVSubtitleRect *rect,
-                      const uint8_t *buf, unsigned int buf_size)
+                      PGSSubObject *object, PGSSubObjectRef *cobj)
 {
-    const uint8_t *rle_bitmap_end;
-    int pixel_count, line_count;
+    const uint8_t *buf = object->rle;
+    const uint8_t *rle_bitmap_end = buf + object->rle_data_len;
 
-    rle_bitmap_end = buf + buf_size;
+    int pixel_count, line_count, crop_offset;
 
+    /* Allocate memory to the rect, can be smaller than the object */
     rect->data[0] = av_malloc_array(rect->w, rect->h);
 
     if (!rect->data[0])
@@ -173,13 +174,15 @@ static int decode_rle(AVCodecContext *avctx, AVSubtitleRect *rect,
 
     pixel_count = 0;
     line_count  = 0;
+    crop_offset = 0;
 
-    while (buf < rle_bitmap_end && line_count < rect->h) {
+    while (buf < rle_bitmap_end && line_count < object->h) {
         uint8_t flags, color;
-        int run;
+        int run, x_adjust, in_window;
 
         color = bytestream_get_byte(&buf);
         run   = 1;
+        in_window = 1;
 
         if (color == 0x00) {
             flags = bytestream_get_byte(&buf);
@@ -189,17 +192,39 @@ static int decode_rle(AVCodecContext *avctx, AVSubtitleRect *rect,
             color = flags & 0x80 ? bytestream_get_byte(&buf) : 0;
         }
 
-        if (run > 0 && pixel_count + run <= rect->w * rect->h) {
-            memset(rect->data[0] + pixel_count, color, run);
+        if (run > 0 && pixel_count + run <= object->w * object->h) {
+            if (cobj->composition_flag & 0x80) {
+                /* Don't copy if outside of cropping window */
+                in_window  = line_count >= cobj->crop_y && line_count <= cobj->crop_y + cobj->crop_h;
+                in_window &= (cobj->crop_x <= (pixel_count % object->w) + run ||
+                              cobj->crop_x + cobj->crop_w >= pixel_count % object->w);
+
+                /* copy only partially if crossing the window edges */
+                if (in_window && pixel_count % object->w < cobj->crop_x) {
+                    x_adjust = cobj->crop_x - (pixel_count % object->w);
+                    run -= x_adjust;
+                    pixel_count += x_adjust;
+                }
+                if (in_window && (pixel_count % object->w) + run > cobj->crop_x + cobj->crop_w) {
+                    x_adjust = (pixel_count % object->w) + run - (cobj->crop_x + cobj->crop_w);
+                    run -= x_adjust;
+                    pixel_count += x_adjust;
+                }
+                /* accumulate buffer offset, this color is outside of cropped area */
+                if (!in_window)
+                    crop_offset += run;
+            }
+            if (in_window)
+                memset(rect->data[0] + pixel_count - crop_offset , color, run);
             pixel_count += run;
         } else if (!run) {
             /*
              * New Line. Check if correct pixels decoded, if not display warning
              * and adjust bitmap pointer to correct new line position.
              */
-            if (pixel_count % rect->w > 0) {
+            if (pixel_count % object->w > 0) {
                 av_log(avctx, AV_LOG_ERROR, "Decoded %d pixels, when line should be %d pixels\n",
-                       pixel_count % rect->w, rect->w);
+                       pixel_count % object->w, object->w);
                 if (avctx->err_recognition & AV_EF_EXPLODE) {
                     return AVERROR_INVALIDDATA;
                 }
@@ -208,8 +233,8 @@ static int decode_rle(AVCodecContext *avctx, AVSubtitleRect *rect,
         }
     }
 
-    if (pixel_count < rect->w * rect->h) {
-        av_log(avctx, AV_LOG_ERROR, "Insufficient RLE data for subtitle\n");
+    if (pixel_count < object->w * object->h) {
+        av_log(avctx, AV_LOG_ERROR, "Insufficient RLE data for subtitle %d %d\n",pixel_count, object->w*object->h);
         return AVERROR_INVALIDDATA;
     }
 
@@ -289,8 +314,8 @@ static int parse_object_segment(AVCodecContext *avctx,
     width  = bytestream_get_be16(&buf);
     height = bytestream_get_be16(&buf);
 
-    /* Make sure the bitmap is not too large */
-    if (avctx->width < width || avctx->height < height || !width || !height) {
+    /* Make sure the bitmap has valid dimensions and can reside in the PG buffer */
+    if (width*height > (4 << 20) || !width || !height) {
         av_log(avctx, AV_LOG_ERROR, "Bitmap dimensions (%dx%d) invalid.\n", width, height);
         return AVERROR_INVALIDDATA;
     }
@@ -554,10 +579,31 @@ static int display_end_segment(AVCodecContext *avctx, AVSubtitle *sub,
         rect->y    = ctx->presentation.objects[i].y;
 
         if (object->rle) {
-            rect->w    = object->w;
-            rect->h    = object->h;
+            if (ctx->presentation.objects[i].composition_flag & 0x80)
+            {
+                rect->w    = ctx->presentation.objects[i].crop_w;
+                rect->h    = ctx->presentation.objects[i].crop_h;
 
-            rect->linesize[0] = object->w;
+                /* Make sure the cropping operation on the object is valid */
+                if (ctx->presentation.objects[i].crop_x + rect->w > object->w ||
+                    ctx->presentation.objects[i].crop_y + rect->h > object->h) {
+                    av_log(avctx, AV_LOG_ERROR, "Invalid crop values (%dx%d at (%d, %d)).\n",
+                           rect->w , rect->h, ctx->presentation.objects[i].crop_x,
+                           ctx->presentation.objects[i].crop_y);
+                    return AVERROR_INVALIDDATA;
+                }
+            } else {
+                rect->w    = object->w;
+                rect->h    = object->h;
+            }
+
+            /* Make sure the bitmap is not too large */
+            if (avctx->width < rect->w || avctx->height < rect->h) {
+                av_log(avctx, AV_LOG_ERROR, "Bitmap dimensions (%dx%d) invalid.\n", rect->w , rect->h);
+                return AVERROR_INVALIDDATA;
+            }
+
+            rect->linesize[0] = rect->w;
 
             if (object->rle_remaining_len) {
                 av_log(avctx, AV_LOG_ERROR, "RLE data length %u is %u bytes shorter than expected\n",
@@ -565,7 +611,7 @@ static int display_end_segment(AVCodecContext *avctx, AVSubtitle *sub,
                 if (avctx->err_recognition & AV_EF_EXPLODE)
                     return AVERROR_INVALIDDATA;
             }
-            ret = decode_rle(avctx, rect, object->rle, object->rle_data_len);
+            ret = decode_rle(avctx, rect, object, &ctx->presentation.objects[i]);
             if (ret < 0) {
                 if ((avctx->err_recognition & AV_EF_EXPLODE) ||
                     ret == AVERROR(ENOMEM)) {
